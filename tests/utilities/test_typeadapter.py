@@ -271,3 +271,21 @@ def test_class_with_methods():
     type_adapter = get_cached_typeadapter(class_with_methods.do_something_return_none)
     schema = type_adapter.json_schema()
     assert "self" not in schema["properties"]
+
+
+def test_bound_method_typeadapter_cache_does_not_grow_with_instances():
+    """Test that bound methods should share a single cached TypeAdapter across instances."""
+    from fastmcp.utilities import types as fastmcp_types
+
+    class C:
+        def f(self, x: int) -> int:
+            return x
+
+    with fastmcp_types._TYPEADAPTER_CACHE_LOCK:
+        fastmcp_types._TYPEADAPTER_CACHE.clear()
+
+    adapters = [get_cached_typeadapter(C().f) for _ in range(250)]
+    assert all(adapter is adapters[0] for adapter in adapters)
+
+    with fastmcp_types._TYPEADAPTER_CACHE_LOCK:
+        assert len(fastmcp_types._TYPEADAPTER_CACHE) == 1

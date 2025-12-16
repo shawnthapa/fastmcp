@@ -17,6 +17,7 @@ from mcp.types import (
 from pydantic import AnyUrl, BaseModel, Field, TypeAdapter
 from typing_extensions import TypedDict
 
+from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import Tool, ToolResult, _convert_to_content
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.tests import caplog_for_fastmcp
@@ -173,6 +174,31 @@ class TestToolFromFunction:
                 "task_config": {"mode": "forbidden"},
             }
         )
+
+    async def test_bound_method_tool_uses_correct_instance_and_disallows_override(self):
+        class Greeter:
+            def __init__(self, prefix: str):
+                self.prefix = prefix
+
+            def greet(self, name: str) -> str:
+                return f"{self.prefix}:{name}"
+
+        a = Greeter("A")
+        b = Greeter("B")
+
+        tool_a = Tool.from_function(a.greet)
+        tool_b = Tool.from_function(b.greet)
+
+        result_a = await tool_a.run({"name": "x"})
+        result_b = await tool_b.run({"name": "x"})
+
+        assert isinstance(result_a.content[0], TextContent)
+        assert result_a.content[0].text == "A:x"
+        assert isinstance(result_b.content[0], TextContent)
+        assert result_b.content[0].text == "B:x"
+
+        with pytest.raises(ToolError):
+            await tool_a.run({"self": "spoof", "name": "x"})
 
     def test_pydantic_model_function(self):
         """Test registering a function that takes a Pydantic model."""

@@ -29,6 +29,7 @@ from pydantic import Field, PydanticSchemaGenerationError, model_validator
 from typing_extensions import TypeVar
 
 import fastmcp
+from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_context, without_injected_parameters
 from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.utilities.components import FastMCPComponent
@@ -377,8 +378,27 @@ class FunctionTool(Tool):
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Run the tool with arguments."""
         wrapper_fn = without_injected_parameters(self.fn)
-        type_adapter = get_cached_typeadapter(wrapper_fn)
-        result = type_adapter.validate_python(arguments)
+        call_args = arguments
+        if inspect.ismethod(wrapper_fn):
+            # `get_cached_typeadapter()` normalizes bound-method cache keys
+            # so we don't build new schemas per-instance. A TypeAdapter built from a
+            # bound method closes over a specific instance, so reusing it for execution
+            # would call the wrong object. For execution, validate/call the unbound
+            # function and inject the bound owner explicitly.
+            unbound = wrapper_fn.__func__
+            type_adapter = get_cached_typeadapter(unbound)
+
+            bound_owner_param = next(iter(inspect.signature(unbound).parameters))
+            if bound_owner_param in arguments:
+                raise ToolError(
+                    f"Argument {bound_owner_param!r} is reserved for bound methods and cannot be provided."
+                )
+
+            call_args = dict(arguments)
+            call_args[bound_owner_param] = wrapper_fn.__self__
+        else:
+            type_adapter = get_cached_typeadapter(wrapper_fn)
+        result = type_adapter.validate_python(call_args)
         if inspect.isawaitable(result):
             result = await result
 

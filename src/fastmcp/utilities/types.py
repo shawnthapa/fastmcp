@@ -4,9 +4,10 @@ import base64
 import inspect
 import mimetypes
 import os
+from collections import OrderedDict
 from collections.abc import Callable
-from functools import lru_cache
 from pathlib import Path
+from threading import RLock
 from types import EllipsisType, UnionType
 from typing import (
     Annotated,
@@ -41,14 +42,35 @@ class FastMCPBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-@lru_cache(maxsize=5000)
-def get_cached_typeadapter(cls: T) -> TypeAdapter[T]:
+_TYPEADAPTER_CACHE_MAXSIZE = 5000
+_TYPEADAPTER_CACHE: OrderedDict[object, TypeAdapter[Any]] = OrderedDict()
+_TYPEADAPTER_CACHE_LOCK = RLock()
+
+
+def get_cached_typeadapter(cls: T) -> TypeAdapter[Any]:
     """
     TypeAdapters are heavy objects, and in an application context we'd typically
     create them once in a global scope and reuse them as often as possible.
     However, this isn't feasible for user-generated functions. Instead, we use a
     cache to minimize the cost of creating them as much as possible.
     """
+    # Normalize cache key: bound methods of the same underlying function should
+    # share a single TypeAdapter, otherwise each instance would trigger a new
+    # schema build and leak CoreSchema dicts over time.
+    if inspect.ismethod(cls):
+        func = cls.__func__
+        owner = getattr(cls, "__self__", None)
+        owner_type = type(owner) if owner is not None else None
+        cache_key: object = (func, owner_type)
+    else:
+        cache_key = cls
+
+    with _TYPEADAPTER_CACHE_LOCK:
+        cached = _TYPEADAPTER_CACHE.get(cache_key)
+        if cached is not None:
+            _TYPEADAPTER_CACHE.move_to_end(cache_key)
+            return cached  # type: ignore[return-value]
+
     # For functions, process annotations to handle forward references and convert
     # Annotated[Type, "string"] to Annotated[Type, Field(description="string")]
     if inspect.isfunction(cls) or inspect.ismethod(cls):
@@ -109,12 +131,17 @@ def get_cached_typeadapter(cls: T) -> TypeAdapter[T]:
                 new_func.__annotations__ = processed_hints
 
                 if inspect.ismethod(cls):
-                    new_method = types.MethodType(new_func, cls.__self__)
-                    return TypeAdapter(new_method)
+                    cls = types.MethodType(new_func, cls.__self__)  # type: ignore[assignment]
                 else:
-                    return TypeAdapter(new_func)
+                    cls = new_func  # type: ignore[assignment]
 
-    return TypeAdapter(cls)
+    adapter: TypeAdapter[Any] = TypeAdapter(cls)
+    with _TYPEADAPTER_CACHE_LOCK:
+        _TYPEADAPTER_CACHE[cache_key] = adapter
+        _TYPEADAPTER_CACHE.move_to_end(cache_key)
+        if len(_TYPEADAPTER_CACHE) > _TYPEADAPTER_CACHE_MAXSIZE:
+            _TYPEADAPTER_CACHE.popitem(last=False)
+    return adapter
 
 
 def issubclass_safe(cls: type, base: type) -> bool:
